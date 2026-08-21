@@ -1,0 +1,31 @@
+# Secrets -- never commit these
+.env
+*.key
+credentials.json
+
+# Raw and derived data.
+# data/raw/ is ignored by default: it is often large, and many licenses
+# do not permit redistribution. If your raw data is small and its license
+# allows it, delete the line below and commit it -- that is better.
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# data/sample/ IS committed on purpose -- the tests run against it.
+
+# Caches
+.cache/
+*.pyc
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# OS noise
+.DS_Store
+Thumbs.db

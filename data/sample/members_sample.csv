@@ -1,0 +1,6 @@
+id,name,state,party,score,joined
+A000001,Example One,VA,D,-0.312,2015-01-06
+A000002,Example Two,TX,R,0.488,2011-01-05
+A000003,Example Three,CA,D,-0.671,2019-01-03
+A000004,Example Four,PR,I,,2023-01-03
+A000005,Example Five,NY,D,0.994,2007-01-04

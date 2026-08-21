@@ -1,0 +1,20 @@
+# Runs the validation checks on every push. Because the tests read from
+# data/sample/ rather than a live API, this works with no secrets.
+#
+# Green check next to your commits = your checks pass. Red X = fix it now
+# rather than discovering it in December.
+
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: pytest -v
