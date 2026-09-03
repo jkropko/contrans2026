@@ -1,16 +1,13 @@
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
 
-WORKDIR /app
+FROM python:3.14.7-slim-trixie
 
-# Dependencies first, so Docker caches this layer and rebuilds stay fast
-# when only your code changes.
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements.txt
 
-COPY . .
+RUN pip install -r requirements.txt
 
-# Render sets $PORT. Default to 8050 for local runs.
-ENV PORT=8050
+WORKDIR /contrans2026
+
 EXPOSE 8050
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8050", "src.app:server"]
+CMD ["python", "skeleton/app.py"]
