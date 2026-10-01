@@ -13,12 +13,14 @@ member and take several minutes for a full Congress. Use --limit while
 you are developing; it is the difference between 20 seconds and 20
 minutes.
 
-The expenditures step does NOT loop -- it pulls the whole cycle in one
-go and filters afterwards. Asking the FEC per candidate needs about
-1,500 requests against a limit of 1,000 an hour.
+The expenditures step makes one request per candidate, and there are
+several hundred. It is resumable: if the API rate limits you part way
+through, rerun and it picks up from where it stopped rather than
+starting over.
 """
 
 import argparse
+import os
 import re
 import sys
 import time
@@ -80,22 +82,37 @@ def pull_sponsored(ct, bioguide_ids):
 
 
 def fec_ids_from_crosswalk(crosswalk, bioguide_ids=None):
-    """Pull FEC candidate ids out of the crosswalk, as a flat set.
+    """Pull the FEC candidate ids we actually need out of the crosswalk.
 
-    One member has several ids -- one per office and cycle they ran for
-    -- and congress-legislators packs them into a single field. Split on
-    commas AND whitespace, because the separator is not guaranteed and a
-    missed split sends "H6FL11126,H6FL11134" as one id, which matches
-    nothing and fails silently.
+    Two things to get right here.
+
+    First, one member has several ids -- one per office and cycle they
+    have run for -- packed into a single field. Split on commas AND
+    whitespace, because the separator is not guaranteed and a missed
+    split sends "H6FL11126,H6FL11134" as one id, which matches nothing
+    and fails silently.
+
+    Second, keep only the id for the chamber they serve in now. A House
+    member who later won a Senate seat has both an H id and an S id, and
+    querying both triples our request count for no benefit. If the
+    crosswalk has no `type` column we keep everything rather than guess.
     """
     df = crosswalk
     if bioguide_ids is not None:
         df = df[df["bioguide_id"].isin(bioguide_ids)]
+
+    prefix_for = {"rep": "H", "sen": "S"}
     ids = set()
-    for value in df["fec_ids"].dropna():
-        for piece in re.split(r"[,\s]+", str(value).strip()):
-            if piece:
-                ids.add(piece)
+    for _, row in df.iterrows():
+        raw = row.get("fec_ids")
+        if pd.isna(raw):
+            continue
+        pieces = [x for x in re.split(r"[,\s]+", str(raw).strip()) if x]
+        wanted = prefix_for.get(str(row.get("type", "")).lower())
+        if wanted:
+            matching = [x for x in pieces if x.startswith(wanted)]
+            pieces = matching or pieces      # fall back if none match
+        ids.update(pieces)
     return ids
 
 
@@ -110,6 +127,10 @@ def main():
                         help="FEC two-year cycle")
     parser.add_argument("--limit", type=int, default=None,
                         help="only this many members, for testing")
+    parser.add_argument("--pace", type=float, default=0.0,
+                        help="seconds to wait between requests. Leave at 0 "
+                             "unless your key is rate limited tightly enough "
+                             "that you would rather run slowly than resume.")
     parser.add_argument("--skip", nargs="*", default=[],
                         help="step names to leave out")
     parser.add_argument("--only", nargs="*", default=None,
@@ -129,7 +150,7 @@ def main():
             parser.error(f"unknown step(s): {', '.join(unknown)}. "
                          f"Choose from: {', '.join(ALL_STEPS)}")
 
-    ct = Contrans(data_dir=args.out)
+    ct = Contrans(data_dir=args.out, pace=args.pace)
 
     def wanted(name):
         if args.only is not None:
@@ -199,27 +220,54 @@ def main():
         log(f"  {len(sponsored)} rows")
 
     if wanted("expenditures"):
-        log(f"independent expenditures ({args.cycle} cycle, House and Senate)")
-        expenditures = ct.get_independent_expenditures(cycle=args.cycle)
-        log(f"  {len(expenditures)} rows before filtering")
-
-        # Filter to our members. The API gives us every federal candidate
-        # for the cycle; we only want the ones currently serving.
         if crosswalk is None:
-            try:
-                crosswalk = ct.load("crosswalk")
-            except FileNotFoundError:
-                log("  no crosswalk available -- keeping all candidates")
-        if crosswalk is not None and "candidate_id" in expenditures.columns:
-            # bioguide_ids is empty when we did not pull the member list --
-            # for instance on a --fec run. In that case keep every member
-            # in the crosswalk rather than filtering to nobody.
-            keep = fec_ids_from_crosswalk(
-                crosswalk, bioguide_ids if bioguide_ids else None)
-            expenditures = expenditures[expenditures["candidate_id"].isin(keep)]
-            log(f"  {len(expenditures)} rows after filtering to {len(keep)} ids")
+            crosswalk = ct.load("crosswalk")
+        fec_ids = sorted(fec_ids_from_crosswalk(
+            crosswalk, bioguide_ids if bioguide_ids else None))
 
-        saved["expenditures"] = ct.save(expenditures, "independent_expenditures")
+        # Resume: skip candidates we already asked about on an earlier
+        # run. We track the ids we ATTEMPTED, not the ones that returned
+        # rows, because plenty of members have no outside spending at all
+        # and we would otherwise re-ask about them every time.
+        attempted = set()
+        previous = pd.DataFrame()
+        try:
+            attempted = set(ct.load("expenditures_attempted")["candidate_id"])
+            previous = ct.load("independent_expenditures")
+        except FileNotFoundError:
+            pass
+
+        todo = [i for i in fec_ids if i not in attempted]
+        if attempted:
+            log(f"independent expenditures -- {len(todo)} left of "
+                f"{len(fec_ids)} ({len(attempted)} done on an earlier run)")
+        else:
+            log(f"independent expenditures -- {len(todo)} candidates, "
+                f"{args.cycle} cycle")
+
+        if todo:
+            fresh, remaining = ct.get_independent_expenditures(
+                todo, cycle=args.cycle)
+            done_now = [i for i in todo if i not in set(remaining)]
+
+            expenditures = (pd.concat([previous, fresh], ignore_index=True)
+                            if not previous.empty else fresh)
+            saved["expenditures"] = ct.save(
+                expenditures, "independent_expenditures")
+            ct.save(pd.DataFrame({"candidate_id":
+                                  sorted(attempted | set(done_now))}),
+                    "expenditures_attempted")
+            log(f"  {len(expenditures)} rows total")
+            if remaining:
+                log(f"  {len(remaining)} candidates still to fetch -- "
+                    f"run the same command again to continue")
+                if not args.pace:
+                    log("  if this keeps happening, add --pace 0.6 and it "
+                        "will run to completion in one go")
+        else:
+            log("  nothing left to fetch")
+            saved["expenditures"] = os.path.join(
+                args.out, "independent_expenditures.parquet")
 
     # -- summary
 

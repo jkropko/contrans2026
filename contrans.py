@@ -17,6 +17,7 @@ every data method below calls it.
 
 import io
 import os
+import time
 
 import dotenv
 import pandas as pd
@@ -25,13 +26,28 @@ import yaml
 
 dotenv.load_dotenv()
 
+# The FEC wants a state alongside office=house, so we loop. Territories
+# are included because the House seats non-voting delegates from them.
+STATES = [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC", "PR", "VI", "GU", "AS", "MP",
+]
+
 
 class Contrans:
 
-    def __init__(self, botname="ds6600", version="0.1", data_dir="data/raw"):
+    def __init__(self, botname="ds6600", version="0.1", data_dir="data/raw",
+                 pace=0.0):
         self.botname = botname
         self.version = version
         self.data_dir = data_dir
+        self.pace = pace              # seconds to wait between requests
+        self.rate_limit = None        # set after each request, from headers
+        self.rate_remaining = None
         os.makedirs(data_dir, exist_ok=True)
 
     # =================================================================
@@ -63,15 +79,29 @@ class Contrans:
         """
         value = os.getenv(name)
         if not value:
-            raise KeyError(f"{name} not found. Is it in your .env file?")
+            raise KeyError(
+                f"{name} not found. Add a line to your .env file:\n"
+                f"    {name}=your_key_here\n"
+                f"and check that .env is in the directory you are running from.")
         return value
 
     def congress_key(self):
+        """The Congress.gov key, from CONGRESS_API_KEY in .env."""
         return self.key("CONGRESS_API_KEY")
 
     def fec_key(self):
-        # One api.data.gov key works for both APIs.
-        return os.getenv("FEC_API_KEY") or self.key("CONGRESS_API_KEY")
+        """The openFEC key, from FEC_API_KEY in .env.
+
+        Kept separate from the Congress key on purpose. Falling back to
+        the other one would be worse than failing: a key the FEC does not
+        recognise comes back as a 403, which reads like a permissions
+        problem rather than a missing variable, and you would go looking
+        in the wrong place.
+
+        If you happen to be using one key for both, set both variables to
+        the same value.
+        """
+        return self.key("FEC_API_KEY")
 
     def get(self, url, params=None, api_key=None):
         """Make one request and return the parsed JSON.
@@ -85,8 +115,15 @@ class Contrans:
         key if the key is in the query string. Ours is in a header, and
         the message below is built by hand so it cannot leak either.
         """
+        if self.pace:
+            time.sleep(self.pace)
         response = requests.get(url, params=params,
                                 headers=self.headers(api_key), timeout=30)
+        # api.data.gov reports your remaining budget on every response.
+        # Worth watching: it is how you find out you are nearly out
+        # BEFORE the request that fails.
+        self.rate_limit = response.headers.get("X-RateLimit-Limit")
+        self.rate_remaining = response.headers.get("X-RateLimit-Remaining")
         if not response.ok:
             raise requests.HTTPError(
                 f"{response.status_code} {response.reason} from {url}\n"
@@ -99,21 +136,28 @@ class Contrans:
     # Pagination: two flavors, because the two APIs differ
     # =================================================================
 
-    def get_offset_pages(self, url, params=None, limit=250, max_pages=100,
+    def get_offset_pages(self, url, params=None, limit=250, max_pages=None,
                          api_key=None):
-        """Congress.gov style: rows 0-249, then 250-499, and so on."""
+        """Congress.gov style: rows 0-249, then 250-499, and so on.
+
+        max_pages is a seatbelt against a loop that never ends, not a
+        quota. Leave it as None to keep going until a short page tells
+        us we are done.
+        """
         params = dict(params or {})
         pages = []
-        for i in range(max_pages):
+        i = 0
+        while max_pages is None or i < max_pages:
+            i += 1
             params["limit"] = limit
-            params["offset"] = i * limit
+            params["offset"] = (i - 1) * limit
             page = self.get(url, params, api_key=api_key)
             pages.append(page)
             if self.count_records(page) < limit:
                 break
         return pages
 
-    def get_fec_pages(self, url, params=None, per_page=100, max_pages=100):
+    def get_fec_pages(self, url, params=None, per_page=100, max_pages=None):
         """FEC style: ask for the rows AFTER a particular row.
 
         Offset pagination is a bet that the data isn't changing. Filings
@@ -123,7 +167,9 @@ class Contrans:
         params = dict(params or {})
         params["per_page"] = per_page
         pages = []
-        for _ in range(max_pages):
+        i = 0
+        while max_pages is None or i < max_pages:
+            i += 1
             page = self.get(url, params, api_key=self.fec_key())
             pages.append(page)
             after = page.get("pagination", {}).get("last_indexes")
@@ -249,7 +295,7 @@ class Contrans:
     # 6. Sponsored legislation, with summaries
     # =================================================================
 
-    def get_sponsored_legislation(self, bioguide_id, max_pages=10):
+    def get_sponsored_legislation(self, bioguide_id, max_pages=None):
         """6a. Bills a member sponsored. One row per bill."""
         url = f"https://api.congress.gov/v3/member/{bioguide_id}/sponsored-legislation"
         pages = self.get_offset_pages(
@@ -305,33 +351,71 @@ class Contrans:
     # 8. FEC independent expenditures
     # =================================================================
 
-    def get_independent_expenditures(self, cycle=2026, offices=("H", "S")):
-        """8. Money spent to support or oppose candidates, for a whole cycle.
+    def get_independent_expenditures(self, candidate_ids, cycle=2026,
+                                     verbose=True):
+        """8. Money spent to support or oppose candidates, by candidate.
 
-        The endpoint will not return everything at once -- it requires
-        either a candidate_id or an office. Asking per candidate needs
-        about 1,500 requests against a limit of 1,000 an hour, so we ask
-        per office instead: two pulls, House and Senate, and we skip
-        presidential candidates entirely rather than downloading and then
-        discarding them.
+        Returns (dataframe, remaining_ids).
 
-        One row per candidate per committee per direction:
-        support_oppose_indicator is S or O. Memoed items are already
-        excluded, so the totals do not double count the 24- and 48-hour
-        notices against the periodic reports.
+        One request per candidate, roughly 540 of them. If the API rate
+        limits us part way through we stop and hand back what we have
+        plus the ids we did not reach, so an interrupted run costs you
+        nothing and you can pick up where you stopped.
+
+        Whatever your limit happens to be, self.rate_remaining carries
+        what the server last reported, so you can watch the budget rather
+        than assume a number.
+
+        Getting to candidate_id took five rejections from this endpoint,
+        each of which said what was missing:
+
+            no filter        -> "Must include candidate_id or office"
+            office="H"       -> "Must be one of: house, senate, president"
+            office="house"   -> "Must include argument 'state'"
+            + state="AL"     -> "Must include argument 'district'"
+
+        Office plus state plus district is 435 House requests and a
+        district table to maintain. candidate_id was the other branch the
+        first error offered, and it needs no lookup tables.
+
+        Pass only the ids you need. Members hold several each -- one per
+        office and cycle they have run for -- so filter to the chamber
+        they serve in now.
         """
         url = "https://api.open.fec.gov/v1/schedules/schedule_e/by_candidate/"
+        candidate_ids = list(candidate_ids)
         frames = []
-        for office in offices:
-            pages = self.get_fec_pages(url, {"cycle": cycle, "office": office})
+        for i, cid in enumerate(candidate_ids):
+            try:
+                pages = self.get_fec_pages(
+                    url, {"cycle": cycle, "candidate_id": cid})
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                if status != 429:
+                    raise
+                remaining = candidate_ids[i:]
+                limit = self.rate_limit or "?"
+                print(f"    rate limited after {i} candidates; "
+                      f"{len(remaining)} left to fetch "
+                      f"(your key allows {limit} per window)", flush=True)
+                if not self.pace:
+                    print("    tip: re-run with --pace to stay under the "
+                          "limit instead of hitting it", flush=True)
+                df = (pd.concat(frames, ignore_index=True)
+                      if frames else pd.DataFrame())
+                return df, remaining
+
             records = [r for page in pages for r in page.get("results", [])]
-            df = pd.json_normalize(records)
-            if not df.empty:
-                df["office"] = office
-                frames.append(df)
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
+            if records:
+                frames.append(pd.json_normalize(records))
+            if verbose and (i + 1) % 50 == 0:
+                left = self.rate_remaining
+                note = f", {left} calls left this hour" if left else ""
+                print(f"    {i + 1} of {len(candidate_ids)} candidates{note}",
+                      flush=True)
+
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return df, []
 
     def get_expenditures_for_candidate(self, candidate_id, cycle=2026):
         """8b. Every individual expenditure for ONE candidate.
