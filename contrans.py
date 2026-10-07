@@ -1,451 +1,342 @@
-"""
-contrans.py -- data acquisition for the Congress Transparency Dashboard
-
-Eight things we need, in one place.
-
-The idea of a class: all of our requests need the same two things -- a
-user agent, so the server knows who is calling, and an API key. Rather
-than repeating that in every script, we write it once in `get()` and
-every data method below calls it.
-
-    from contrans import Contrans
-
-    ct = Contrans()
-    members = ct.get_members()
-    ct.save(members, "members")
-"""
-
-import io
+import numpy as np
+import pandas as pd
+pd.options.mode.copy_on_write = True
+import requests
+import json
+import dotenv
 import os
 import time
-
-import dotenv
-import pandas as pd
-import requests
 import yaml
 
-dotenv.load_dotenv()
+class contrans:
 
-# The FEC wants a state alongside office=house, so we loop. Territories
-# are included because the House seats non-voting delegates from them.
-STATES = [
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
-    "DC", "PR", "VI", "GU", "AS", "MP",
-]
+# ENV variables and user agent
+    def __init__(self):
+        dotenv.load_dotenv()
+        self.POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD')
+        self.congresskey = os.getenv('congresskey')
+        self.feckey = os.getenv('feckey')
+        self.botname = 'contrans'
+        self.version = '0.0'
+        self.github = 'https://github.com/jkropko/contrans2026'
+        self.useragent = f'{self.botname}/{self.version} ({self.github}) python-requests/{requests.__version__}'
+        self.headers = {'User-Agent': self.useragent}
 
+# Raw data acquisition
+## build crosswalk with ideology
+    def get_crosswalk(self, congress=119):
+        url = f'https://voteview.com/static/data/out/members/HS{congress}_members.csv'
+        ideology = pd.read_csv(url)
 
-class Contrans:
+        cols_to_keep = ['bioname','chamber', 'nominate_dim1', 'party_code',
+                        'state_abbrev','district_code','icpsr', 'bioguide_id']
+        ideology = ideology[cols_to_keep]
+        replace_map = {200: 'Republican', 
+               100: 'Democrat',
+               328: 'Independent'}
+        ideology['party'] = ideology['party_code'].replace(replace_map)
+        ideology = ideology.drop(['party_code'], axis=1)
+        ideology = ideology.rename({'nominate_dim1': 'left_right_ideology'}, axis=1)
 
-    def __init__(self, botname="ds6600", version="0.1", data_dir="data/raw",
-                 pace=0.0):
-        self.botname = botname
-        self.version = version
-        self.data_dir = data_dir
-        self.pace = pace              # seconds to wait between requests
-        self.rate_limit = None        # set after each request, from headers
-        self.rate_remaining = None
-        os.makedirs(data_dir, exist_ok=True)
+        # VoteView has no FEC IDs; congress-legislators lists them (one or more per member)
+        legislators = self.get_legislators_yaml('legislators-current.yaml')
+        fec_ids = pd.DataFrame([{'bioguide_id': x['id']['bioguide'],
+                                 'fec_id': x['id'].get('fec')} for x in legislators])
+        ideology = pd.merge(ideology, fec_ids, on='bioguide_id', how='left')
+        ideology.to_parquet('data/raw/ideology.parquet', index=False)
 
-    # =================================================================
-    # Setup: the things every request needs
-    # =================================================================
+## get biodata and terms
+    def get_bio_data(self, bioguide_id):
+        root = 'https://api.congress.gov/v3'
+        endpoint = f'/member/{bioguide_id}'
 
-    def useragent(self):
-        """Identify our code to the servers we call."""
-        return f"{self.botname}/{self.version} python-requests/{requests.__version__}"
+        params = {'format': 'json', 'api_key': self.congresskey} 
 
-    def headers(self, api_key=None):
-        """Headers for a request. Pass a key and it goes in a header.
+        r = requests.get(root + endpoint, headers = self.headers, params = params)
+        myjson = json.loads(r.text)['member']
+        terms = myjson['terms'] 
+        terms = pd.DataFrame(terms)
+        terms['bioguide_id'] = bioguide_id
+        try:
+            terms['endYear'] = terms['endYear'].fillna(2027).astype(int)
+        except: 
+            terms['endYear'] = 2027
+        termdata = terms[['bioguide_id','chamber', 'congress', 'stateCode', 'startYear', 'endYear']]
+        try:
+            termdata['district'] = terms['district']
+        except:
+            termdata['district'] = None
+        member = {
+            'bioguide_id': myjson['bioguideId'],
+            'Full name':myjson['directOrderName'],
+            'Chamber': myjson['terms'][-1]['chamber'],
+            'State': myjson['state'],
+            'Party': myjson['partyHistory'][-1]['partyName']}
+        try:
+            member['District'] = myjson['district']
+        except:
+            member['District'] = None
+        try:
+            member['birthYear'] = myjson['birthYear']
+        except:
+            pass
+        try:
+            member['image'] = myjson['depiction']['imageUrl']
+        except:
+            pass
+        try:
+            member['Office address'] = f'{myjson["addressInformation"]["officeAddress"]}, {myjson["addressInformation"]["city"]}, {myjson["addressInformation"]["district"]} {myjson["addressInformation"]["zipCode"]}'
+            member['Phone'] = myjson['addressInformation']['phoneNumber']
+            member['Website'] = myjson['officialWebsiteUrl']
+        except:
+            pass
+        return termdata, member   
 
-        Keys belong in headers, not in the URL. A key in the query string
-        ends up in tracebacks, server logs, and browser history -- and
-        requests puts the full URL into the error it raises, so one failed
-        call prints your credential to the terminal.
-        """
-        h = {"User-Agent": self.useragent()}
-        if api_key:
-            h["X-Api-Key"] = api_key
-        return h
-
-    def key(self, name):
-        """Read one API key from the .env file.
-
-        We raise instead of returning None: a request sent with an empty
-        key fails later, and more confusingly, than this does.
-        """
-        value = os.getenv(name)
-        if not value:
-            raise KeyError(
-                f"{name} not found. Add a line to your .env file:\n"
-                f"    {name}=your_key_here\n"
-                f"and check that .env is in the directory you are running from.")
-        return value
-
-    def congress_key(self):
-        """The Congress.gov key, from CONGRESS_API_KEY in .env."""
-        return self.key("CONGRESS_API_KEY")
-
-    def fec_key(self):
-        """The openFEC key, from FEC_API_KEY in .env.
-
-        Kept separate from the Congress key on purpose. Falling back to
-        the other one would be worse than failing: a key the FEC does not
-        recognise comes back as a 403, which reads like a permissions
-        problem rather than a missing variable, and you would go looking
-        in the wrong place.
-
-        If you happen to be using one key for both, set both variables to
-        the same value.
-        """
-        return self.key("FEC_API_KEY")
-
-    def get(self, url, params=None, api_key=None):
-        """Make one request and return the parsed JSON.
-
-        We don't use raise_for_status(). It raises on the status code and
-        throws away the response body -- but for a 4xx the body is where
-        the server tells you which parameter it did not like. Losing that
-        turns a two-minute fix into an afternoon.
-
-        It also puts the full URL in the error message, which leaks the
-        key if the key is in the query string. Ours is in a header, and
-        the message below is built by hand so it cannot leak either.
-        """
-        if self.pace:
-            time.sleep(self.pace)
-        response = requests.get(url, params=params,
-                                headers=self.headers(api_key), timeout=30)
-        # api.data.gov reports your remaining budget on every response.
-        # Worth watching: it is how you find out you are nearly out
-        # BEFORE the request that fails.
-        self.rate_limit = response.headers.get("X-RateLimit-Limit")
-        self.rate_remaining = response.headers.get("X-RateLimit-Remaining")
-        if not response.ok:
-            raise requests.HTTPError(
-                f"{response.status_code} {response.reason} from {url}\n"
-                f"  params: { {k: v for k, v in (params or {}).items()} }\n"
-                f"  server said: {response.text[:600]}",
-                response=response)
-        return response.json()
-
-    # =================================================================
-    # Pagination: two flavors, because the two APIs differ
-    # =================================================================
-
-    def get_offset_pages(self, url, params=None, limit=250, max_pages=None,
-                         api_key=None):
-        """Congress.gov style: rows 0-249, then 250-499, and so on.
-
-        max_pages is a seatbelt against a loop that never ends, not a
-        quota. Leave it as None to keep going until a short page tells
-        us we are done.
-        """
-        params = dict(params or {})
-        pages = []
+    def save_bio_terms(self):
+        ideology = pd.read_parquet('data/raw/ideology.parquet')
+        bioguide_ids = ideology['bioguide_id'].dropna().unique()
+        memberlist = []
+        termslist = []
         i = 0
-        while max_pages is None or i < max_pages:
+        for bioguide_id in bioguide_ids:
+            if i % 10 == 0:
+                print(f'Now uploading legislator {i} ({bioguide_id}) of {len(bioguide_ids)}')
+            terms, member = self.get_bio_data(bioguide_id)
+            termslist.append(terms)
+            memberlist.append(member)
             i += 1
-            params["limit"] = limit
-            params["offset"] = (i - 1) * limit
-            page = self.get(url, params, api_key=api_key)
-            pages.append(page)
-            if self.count_records(page) < limit:
+        member = pd.DataFrame(memberlist)
+        terms = pd.concat(termslist)
+        member.to_parquet(f'data/raw/bioinfo.parquet', index=False)
+        terms.to_parquet(f'data/raw/terms.parquet', index=False)
+
+## vote similarity matrix
+    def get_vote_similarity_data(self, congress=119):
+        url = f'https://voteview.com/static/data/out/votes/HS{congress}_votes.csv'
+        votes = pd.read_csv(url)
+        votes = votes.drop(['congress', 'prob'], axis=1)
+        vote_compare = pd.merge(votes, votes,
+                        on = ['chamber', 'rollnumber'],
+                        how = 'inner')
+        vote_compare = vote_compare.query("icpsr_x != icpsr_y")
+        vote_compare['agree'] = vote_compare['cast_code_x'] == vote_compare['cast_code_y']
+        vote_compare = vote_compare.groupby(['icpsr_x', 'icpsr_y']).agg({'agree': 'mean'}).reset_index()
+        crosswalk = pd.read_parquet('data/raw/ideology.parquet')
+        vote_compare =pd.merge(vote_compare, crosswalk,
+                left_on='icpsr_x',
+                right_on='icpsr',
+                how='inner')
+        vote_compare = vote_compare[['bioname', 'icpsr_y', 'agree']]
+        vote_compare =pd.merge(vote_compare, crosswalk,
+                left_on='icpsr_y',
+                right_on='icpsr',
+                how='inner')
+        vote_compare = vote_compare[['bioname_x', 'bioname_y', 'agree']]
+        vote_compare = vote_compare.rename({'bioname_x': 'bioname',
+                                        'bioname_y': 'comparison_member'}, axis=1)
+        vote_compare.to_parquet('data/raw/vote_compare.parquet', index=False)
+
+## Sponsored legislation
+
+    def get_sponsored_legislation_member(self, bioguide_id, congress=119):
+        root = 'https://api.congress.gov/v3'
+        endpoint = f'/member/{bioguide_id}/sponsored-legislation'
+        params = {'format': 'json',
+                  'offset': 0,
+                  'limit': 250,
+                  'api_key': self.congresskey}
+
+        legislation = []
+        while True:
+            r = requests.get(root + endpoint, headers=self.headers, params=params)
+            if r.status_code == 429:   # rate limited: wait, then retry the same page
+                time.sleep(60)
+                continue
+            r.raise_for_status()
+            myjson = r.json()
+
+            batch = myjson.get('sponsoredLegislation', [])
+            legislation = legislation + batch
+
+            total = myjson.get('pagination', {}).get('count')
+            params['offset'] += params['limit']
+            if len(batch) < params['limit'] or (total is not None and params['offset'] >= total):
                 break
-        return pages
 
-    def get_fec_pages(self, url, params=None, per_page=100, max_pages=None):
-        """FEC style: ask for the rows AFTER a particular row.
+        s = [x for x in legislation if x.get('congress') == congress]
+        s = [{k: v for k, v in x.items() if k in ['introducedDate', 'type', 'number', 'title', 'url']} for x in s]
+        spons = pd.DataFrame(s)
+        spons['bioguide_id'] = bioguide_id
+        return spons
 
-        Offset pagination is a bet that the data isn't changing. Filings
-        arrive continuously, so a row inserted between requests shifts
-        everything after it and you miss records.
-        """
-        params = dict(params or {})
-        params["per_page"] = per_page
-        pages = []
-        i = 0
-        while max_pages is None or i < max_pages:
-            i += 1
-            page = self.get(url, params, api_key=self.fec_key())
-            pages.append(page)
-            after = page.get("pagination", {}).get("last_indexes")
-            if not after:
-                break
-            params.update(after)
-        return pages
-
-    def count_records(self, page):
-        """How many records came back in one page response."""
-        if "results" in page:
-            return len(page["results"])
-        for value in page.values():
-            if isinstance(value, list):
-                return len(value)
-        return 0
-
-    # =================================================================
-    # 1 and 2. Voteview (bulk CSV, no key)
-    # =================================================================
-
-    def _voteview(self, kind, congress):
-        tag = "HSall" if congress is None else f"HS{congress}"
-        url = f"https://voteview.com/static/data/out/{kind}/{tag}_{kind}.csv"
-        response = requests.get(url, headers=self.headers(), timeout=120)
-        response.raise_for_status()
-        # icpsr and state codes are identifiers, not numbers. Read as
-        # integers they lose leading zeros, and you can do arithmetic on
-        # a code number, which you never want to be able to do.
-        return pd.read_csv(io.BytesIO(response.content),
-                           dtype={"icpsr": "string",
-                                  "state_icpsr": "string",
-                                  "district_code": "string"})
-
-    def get_ideology(self, congress=119):
-        """1. Ideology scores from Voteview. One row per member per congress.
-
-        The DW-NOMINATE columns are nominate_dim1 (liberal to conservative)
-        and nominate_dim2. Also carries bioguide_id, which is the free half
-        of our crosswalk.
-
-        Note: NOMINATE is re-estimated over the whole history whenever new
-        votes are added, so a member who cast no new votes can still have a
-        different score after a refresh.
-        """
-        return self._voteview("members", congress)
-
-    def get_votes(self, congress=119):
-        """2. Every vote cast. One row per member per roll call.
-
-        The full history is millions of rows. Pass a congress number.
-        """
-        return self._voteview("votes", congress)
-
-    # =================================================================
-    # 3 and 4. Congress.gov member data
-    # =================================================================
-
-    def get_members(self, congress=119):
-        """3. Every member of a Congress. One row each, with bioguideId.
-
-        This is the list we loop over for everything member-specific.
-        """
-        url = f"https://api.congress.gov/v3/member/congress/{congress}"
-        pages = self.get_offset_pages(
-            url, {"format": "json"}, api_key=self.congress_key())
-        records = [m for page in pages for m in page.get("members", [])]
-        return pd.json_normalize(records)
-
-    def get_member(self, bioguide_id):
-        """4. One member in detail: terms, party history, leadership roles.
-
-        The list endpoint gives a summary; tenure has to be computed from
-        the terms, which only appear here. One call per member.
-        """
-        url = f"https://api.congress.gov/v3/member/{bioguide_id}"
-        page = self.get(url, {"format": "json"},
-                        api_key=self.congress_key())
-        return page.get("member", {})
-
-    # =================================================================
-    # 5. Committee assignments -- NOT from Congress.gov
-    # =================================================================
-
-    def get_committee_assignments(self):
-        """5. Which members sit on which committees.
-
-        Congress.gov does not provide this, in either direction:
-
-          /member/{bioguideId}          has no committee field
-          /committee/{chamber}/{code}   returns bills, reports,
-                                        communications, subcommittees,
-                                        history, type -- no roster
-
-        Verified against /committee/house/hsju00, which returns 74,379
-        bills referred to House Judiciary and 15 subcommittees, and not
-        one member. The API models a committee as something bills flow
-        through, not as a group of people. That is a defensible design
-        and it is simply not the question we are asking.
-
-        So this comes from congress-legislators instead -- the same
-        project as the crosswalk in method 7. One row per member per
-        committee.
-        """
-        url = ("https://unitedstates.github.io/congress-legislators/"
-               "committee-membership-current.yaml")
-        response = requests.get(url, headers=self.headers(), timeout=60)
-        response.raise_for_status()
-        data = yaml.safe_load(response.text)
-
-        rows = []
-        for committee_id, members in data.items():
-            for member in members:
-                rows.append({"committee_id": committee_id,
-                             "bioguide_id": member.get("bioguide"),
-                             "name": member.get("name"),
-                             "party": member.get("party"),
-                             "title": member.get("title"),
-                             "rank": member.get("rank")})
-        return pd.DataFrame(rows)
-
-    # =================================================================
-    # 6. Sponsored legislation, with summaries
-    # =================================================================
-
-    def get_sponsored_legislation(self, bioguide_id, max_pages=None):
-        """6a. Bills a member sponsored. One row per bill."""
-        url = f"https://api.congress.gov/v3/member/{bioguide_id}/sponsored-legislation"
-        pages = self.get_offset_pages(
-            url, {"format": "json"}, limit=250, max_pages=max_pages,
-            api_key=self.congress_key())
-        records = [b for page in pages
-                   for b in page.get("sponsoredLegislation", [])]
-        df = pd.json_normalize(records)
-        if not df.empty:
-            df["sponsor_bioguide_id"] = bioguide_id
-        return df
-
-    def get_bill_summary(self, congress, bill_type, bill_number):
-        """6b. CRS summaries for one bill.
-
-        Summaries are a separate endpoint, so this is ONE CALL PER BILL.
-        A member with 40 bills costs 40 requests on top of the one above.
-        Across 535 members that is tens of thousands of requests, so pull
-        the sponsored lists first and decide which bills you actually need
-        summaries for.
-        """
-        url = (f"https://api.congress.gov/v3/bill/{congress}/"
-               f"{bill_type.lower()}/{bill_number}/summaries")
-        page = self.get(url, {"format": "json"},
-                        api_key=self.congress_key())
-        return pd.json_normalize(page.get("summaries", []))
-
-    # =================================================================
-    # 7. The crosswalk
-    # =================================================================
-
-    def get_crosswalk(self):
-        """7. Identifier crosswalk from unitedstates/congress-legislators.
-
-        One row per member, with bioguide, ICPSR, and FEC candidate ids
-        among others. This is what lets us join Congress.gov to Voteview
-        and to the FEC.
-
-        Note the FEC column: a member can have several FEC candidate ids,
-        one per office and cycle they ran for, so that column holds a list
-        rather than a single value.
-        """
-        url = ("https://unitedstates.github.io/congress-legislators/"
-               "legislators-current.csv")
-        response = requests.get(url, headers=self.headers(), timeout=60)
-        response.raise_for_status()
-        return pd.read_csv(io.BytesIO(response.content),
-                           dtype={"bioguide_id": "string",
-                                  "icpsr_id": "string",
-                                  "fec_ids": "string"})
-
-    # =================================================================
-    # 8. FEC independent expenditures
-    # =================================================================
-
-    def get_independent_expenditures(self, candidate_ids, cycle=2026,
-                                     verbose=True):
-        """8. Money spent to support or oppose candidates, by candidate.
-
-        Returns (dataframe, remaining_ids).
-
-        One request per candidate, roughly 540 of them. If the API rate
-        limits us part way through we stop and hand back what we have
-        plus the ids we did not reach, so an interrupted run costs you
-        nothing and you can pick up where you stopped.
-
-        Whatever your limit happens to be, self.rate_remaining carries
-        what the server last reported, so you can watch the budget rather
-        than assume a number.
-
-        Getting to candidate_id took five rejections from this endpoint,
-        each of which said what was missing:
-
-            no filter        -> "Must include candidate_id or office"
-            office="H"       -> "Must be one of: house, senate, president"
-            office="house"   -> "Must include argument 'state'"
-            + state="AL"     -> "Must include argument 'district'"
-
-        Office plus state plus district is 435 House requests and a
-        district table to maintain. candidate_id was the other branch the
-        first error offered, and it needs no lookup tables.
-
-        Pass only the ids you need. Members hold several each -- one per
-        office and cycle they have run for -- so filter to the chamber
-        they serve in now.
-        """
-        url = "https://api.open.fec.gov/v1/schedules/schedule_e/by_candidate/"
-        candidate_ids = list(candidate_ids)
-        frames = []
-        for i, cid in enumerate(candidate_ids):
+    def get_sponsored_legislation(self):
+        sl_list = []
+        failed = []
+        ideology = pd.read_parquet('data/raw/ideology.parquet')
+        bioguide_ids = ideology['bioguide_id'].dropna().unique()
+        for i, bioguide_id in enumerate(bioguide_ids):
+            if i % 10 == 0:
+                print(f'Now uploading legislator {i} ({bioguide_id}) of {len(bioguide_ids)}')
             try:
-                pages = self.get_fec_pages(
-                    url, {"cycle": cycle, "candidate_id": cid})
+                spons = self.get_sponsored_legislation_member(bioguide_id)
+                sl_list.append(spons)
             except requests.HTTPError as e:
-                status = getattr(e.response, "status_code", None)
-                if status != 429:
-                    raise
-                remaining = candidate_ids[i:]
-                limit = self.rate_limit or "?"
-                print(f"    rate limited after {i} candidates; "
-                      f"{len(remaining)} left to fetch "
-                      f"(your key allows {limit} per window)", flush=True)
-                if not self.pace:
-                    print("    tip: re-run with --pace to stay under the "
-                          "limit instead of hitting it", flush=True)
-                df = (pd.concat(frames, ignore_index=True)
-                      if frames else pd.DataFrame())
-                return df, remaining
+                print(f'Skipping {bioguide_id}: {e}')
+                failed.append(bioguide_id)
+        spons = pd.concat(sl_list)
+        spons.to_parquet('data/raw/sponsored_legislation.parquet', index=False)
+        if failed:
+            print(f'{len(failed)} members failed: {failed}')
 
-            records = [r for page in pages for r in page.get("results", [])]
-            if records:
-                frames.append(pd.json_normalize(records))
-            if verbose and (i + 1) % 50 == 0:
-                left = self.rate_remaining
-                note = f", {left} calls left this hour" if left else ""
-                print(f"    {i + 1} of {len(candidate_ids)} candidates{note}",
-                      flush=True)
+## Bill summaries
+    def get_bill_summaries(self, congress=119):
+        root = 'https://api.congress.gov/v3'
+        endpoint = f'/summaries/{congress}'
+        # without a date window this endpoint returns only the last day's summaries;
+        # a Congress begins January 3 of odd year (1789 + 2 * (congress - 1)), e.g. 2025 for the 119th
+        start_year = 1789 + 2 * (congress - 1)
+        now = pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%dT%H:%M:%SZ')
+        params = {'format': 'json',
+                  'offset': 0,
+                  'limit': 250,
+                  'sort': 'updateDate asc',   # requests encodes the space as '+'
+                  'fromDateTime': f'{start_year}-01-01T00:00:00Z',
+                  'toDateTime': now,
+                  'api_key': self.congresskey}
 
-        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        return df, []
+        sum_list = []
+        while True:
+            r = requests.get(root + endpoint, headers=self.headers, params=params)
+            if r.status_code == 429:   # rate limited: wait, then retry the same page
+                time.sleep(60)
+                continue
+            r.raise_for_status()
+            myjson = r.json()
 
-    def get_expenditures_for_candidate(self, candidate_id, cycle=2026):
-        """8b. Every individual expenditure for ONE candidate.
+            batch = myjson.get('summaries', [])
+            sum_list = sum_list + batch
 
-        Use this for a drill-down -- who spent it, on what, when -- not
-        for the whole roster. One call per candidate is how you run out
-        of requests.
-        """
-        url = "https://api.open.fec.gov/v1/schedules/schedule_e/"
-        pages = self.get_fec_pages(
-            url, {"candidate_id": candidate_id, "cycle": cycle})
-        records = [r for page in pages for r in page.get("results", [])]
-        df = pd.json_normalize(records)
-        if not df.empty:
-            df["candidate_id_queried"] = candidate_id
-        return df
+            total = myjson.get('pagination', {}).get('count')
+            print(f'{len(sum_list)} of {total} summaries')
+            params['offset'] += params['limit']
+            if len(batch) < params['limit'] or (total is not None and params['offset'] >= total):
+                break
 
-    # =================================================================
-    # Saving
-    # =================================================================
+        summaries = pd.json_normalize(sum_list)
+        summaries = summaries.drop_duplicates()
+        summaries.to_parquet(f'data/raw/bill_summaries_{congress}.parquet', index=False)
 
-    def save(self, df, name):
-        """Write a dataframe to Parquet.
+## Committees
+    def get_legislators_yaml(self, filename):
+        url = f'https://raw.githubusercontent.com/unitedstates/congress-legislators/main/{filename}'
+        r = requests.get(url, headers=self.headers)
+        r.raise_for_status()
+        return yaml.safe_load(r.text)
 
-        Parquet, not CSV, because it carries the column types with it. A
-        CSV round trip turns "00123" into 123 and loses the zeros.
-        """
-        path = os.path.join(self.data_dir, name + ".parquet")
-        df.to_parquet(path, index=False)
-        return path
+    def get_committees(self):
+        committees_yaml = self.get_legislators_yaml('committees-current.yaml')
+        committee_list = []
+        for c in committees_yaml:
+            committee_list.append({'committee_code': c['thomas_id'],
+                                   'committee_name': c['name'],
+                                   'parent_code': c['thomas_id'],
+                                   'subcommittee': False,
+                                   'chamber': c['type'].capitalize(),
+                                   'url': c.get('url')})
+            for s in c.get('subcommittees', []):
+                committee_list.append({'committee_code': c['thomas_id'] + s['thomas_id'],
+                                       'committee_name': s['name'],
+                                       'parent_code': c['thomas_id'],
+                                       'subcommittee': True,
+                                       'chamber': c['type'].capitalize(),
+                                       'url': None})
+        committees = pd.DataFrame(committee_list)
+        committees.to_parquet('data/raw/committees.parquet', index=False)
+        return committees
 
-    def load(self, name):
-        return pd.read_parquet(os.path.join(self.data_dir, name + ".parquet"))
+    def get_committee_membership(self):
+        membership_yaml = self.get_legislators_yaml('committee-membership-current.yaml')
+        member_list = []
+        for committee_code, members in membership_yaml.items():
+            for m in members:
+                member_list.append({'committee_code': committee_code,
+                                    'bioguide_id': m['bioguide'],
+                                    'party': m.get('party'),
+                                    'rank': m.get('rank'),
+                                    'title': m.get('title')})
+        membership = pd.DataFrame(member_list)
+        membership.to_parquet('data/raw/committee_members.parquet', index=False)
+        return membership
+
+## FEC
+    def get_schedule_e(self, fec_id, cycle=2026):
+        root = 'https://api.open.fec.gov'
+        endpoint = '/v1/schedules/schedule_e/'
+        params = {'api_key': self.feckey,
+                    'candidate_id': fec_id,
+                    'cycle': cycle,
+                    'most_recent': True,
+                    'per_page': 100}
+
+        results = []
+        while True:
+            r = requests.get(root + endpoint, params=params, headers=self.headers)
+            if r.status_code == 429:   # rate limited: wait, then retry the same page
+                print('Rate limited by FEC; waiting 60 seconds')
+                time.sleep(60)
+                continue
+            r.raise_for_status()
+            myjson = r.json()
+
+            batch = myjson['results']
+            if len(batch) == 0:
+                break
+            results.extend(batch)
+            print(f'{fec_id}: {len(results)} of about {myjson["pagination"]["count"]} expenditures')
+
+            # copy whatever cursor keys the API hands back; it swaps last_expenditure_date
+            # for sort_null_only=True once it reaches records with no date
+            params.pop('last_expenditure_date', None)
+            params.update(myjson['pagination']['last_indexes'])
+
+        schedule_e = pd.json_normalize(results)
+        schedule_e['fec_id'] = fec_id
+        return schedule_e
+
+    def get_all_schedule_e(self, cycle=2026, fec_col='fec_id', save_every=25):
+        ideology = pd.read_parquet('data/raw/ideology.parquet')
+
+        # one row per FEC ID; explode() splits list cells (members who ran for more than one office)
+        ids = ideology[['bioguide_id', fec_col]].explode(fec_col)
+        ids = ids.rename({fec_col: 'fec_id'}, axis=1)
+        ids = ids.dropna(subset=['fec_id']).drop_duplicates(subset=['fec_id'])
+
+        # pick up where a previous run left off
+        outfile = f'data/raw/schedule_e_{cycle}.parquet'
+        try:
+            schedule_e = pd.read_parquet(outfile)
+            ids = ids[~ids['fec_id'].isin(schedule_e['fec_id'])]
+            sche_list = [schedule_e]
+        except FileNotFoundError:
+            sche_list = []
+        print(f'{len(ids)} FEC IDs still to download')
+
+        failed = []
+        for i, (bioguide_id, fec_id) in enumerate(zip(ids['bioguide_id'], ids['fec_id'])):
+            print(f'Now downloading FEC ID {i + 1} of {len(ids)} ({fec_id})')
+            try:
+                newdata = self.get_schedule_e(fec_id, cycle=cycle)
+            except requests.HTTPError as e:
+                print(f'Skipping {fec_id}: {e}')
+                failed.append(fec_id)
+                continue
+            newdata['bioguide_id'] = bioguide_id
+            sche_list.append(newdata)
+            if (i + 1) % save_every == 0:   # checkpoint so a crash doesn't lose everything
+                pd.concat(sche_list, ignore_index=True).to_parquet(outfile, index=False)
+
+        schedule_e = pd.concat(sche_list, ignore_index=True)
+        schedule_e.to_parquet(outfile, index=False)
+        if failed:
+            print(f'{len(failed)} FEC IDs failed; rerun to retry them: {failed}')
+        return schedule_e
