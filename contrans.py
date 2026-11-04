@@ -90,7 +90,8 @@ class contrans:
             member['Website'] = myjson['officialWebsiteUrl']
         except:
             pass
-        return termdata, member   
+        termdata.to_parquet('data/raw/terms.parquet', index=False), 
+        member.to_parquet('data/raw/bioinfo.parquet', index=False)   
 
     def save_bio_terms(self):
         ideology = pd.read_parquet('data/raw/ideology.parquet')
