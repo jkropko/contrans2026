@@ -7,6 +7,7 @@ import dotenv
 import os
 import time
 import yaml
+from sqlalchemy import create_engine
 
 class contrans:
 
@@ -21,6 +22,8 @@ class contrans:
         self.github = 'https://github.com/jkropko/contrans2026'
         self.useragent = f'{self.botname}/{self.version} ({self.github}) python-requests/{requests.__version__}'
         self.headers = {'User-Agent': self.useragent}
+        db_url = os.getenv('NEON_DATABASE_URL_UNPOOLED')
+        engine = create_engine(self.db_url.replace('postgresql://', 'postgresql+psycopg://'), pool_pre_ping=True)
 
 # Raw data acquisition
 ## build crosswalk with ideology
@@ -90,8 +93,7 @@ class contrans:
             member['Website'] = myjson['officialWebsiteUrl']
         except:
             pass
-        termdata.to_parquet('data/raw/terms.parquet', index=False), 
-        member.to_parquet('data/raw/bioinfo.parquet', index=False)   
+        return termdata, member   
 
     def save_bio_terms(self):
         ideology = pd.read_parquet('data/raw/ideology.parquet')
