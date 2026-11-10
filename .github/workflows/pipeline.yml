@@ -5,7 +5,7 @@ name: contrans-pipeline
 
 on:
   schedule:
-    - cron: '0 11 * * 1'    # Mondays 11:00 UTC (6am EST / 7am EDT). GitHub cron is always UTC.
+    - cron: '37 7 * * 6'     # Saturdays 7:37 UTC (1:37am EST / 2:37am EDT). GitHub cron is always UTC.
   workflow_dispatch:         # adds a "Run workflow" button on the Actions tab, for testing
 
 jobs:
