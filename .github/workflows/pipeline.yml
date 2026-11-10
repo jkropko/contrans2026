@@ -1,0 +1,46 @@
+# Save as .github/workflows/pipeline.yml
+# Runs flow.py on a GitHub-hosted computer every Monday, reporting to Prefect Cloud.
+
+name: contrans-pipeline
+
+on:
+  schedule:
+    - cron: '0 11 * * 1'    # Mondays 11:00 UTC (6am EST / 7am EDT). GitHub cron is always UTC.
+  workflow_dispatch:         # adds a "Run workflow" button on the Actions tab, for testing
+
+jobs:
+  run-flow:
+    runs-on: ubuntu-latest   # comes with Docker and docker compose
+    timeout-minutes: 350     # GitHub stops any job at 6 hours
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install pipeline packages
+        run: pip install -r requirements-pipeline.txt
+
+      # .env is gitignored, so it isn't in the checkout. Rebuild it from repository secrets.
+      # compose.yaml needs it (env_file: .env), and so does contrans.py (dotenv).
+      - name: Write .env from secrets
+        env:
+          CONGRESSKEY: ${{ secrets.CONGRESSKEY }}
+          FECKEY: ${{ secrets.FECKEY }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          NEON_DATABASE_URL_UNPOOLED: ${{ secrets.NEON_DATABASE_URL_UNPOOLED }}
+        run: |
+          {
+            echo "congresskey=$CONGRESSKEY"
+            echo "feckey=$FECKEY"
+            echo "POSTGRES_PASSWORD=$POSTGRES_PASSWORD"
+            echo "NEON_DATABASE_URL_UNPOOLED=$NEON_DATABASE_URL_UNPOOLED"
+          } > .env
+
+      - name: Run the Prefect flow
+        env:
+          PREFECT_API_URL: ${{ secrets.PREFECT_API_URL }}   # sends the run to your Cloud workspace
+          PREFECT_API_KEY: ${{ secrets.PREFECT_API_KEY }}
+        run: python flow.py 
