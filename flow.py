@@ -35,6 +35,29 @@ def docker_launch():
 ## Upload processed data to postgres
 data_to_postgres = task(ct.data_to_postgres, name='data_to_postgres')
 
+## Deploy to Neon
+@task
+def deploy_neon_dump():
+    with open('contrans.dump', 'wb') as dump:
+        result = subprocess.run(['docker', 'compose', 'exec', '-T', 'postgres',
+                                 'pg_dump', '-U', 'postgres', '-d', 'contrans', '-Fc', '-v'],
+                                stdout=dump, stderr=subprocess.PIPE,
+                                encoding='utf-8', errors='replace')
+    print(result.stderr)          
+    result.check_returncode()
+
+@task
+def deploy_neon_restore():
+    with open('contrans.dump', 'rb') as dump:                # replaces "< contrans.dump"
+        result = subprocess.run(['docker', 'compose', 'exec', '-T', 'postgres', 'sh', '-c',
+                                 'pg_restore -v --no-owner --no-privileges --clean --if-exists '
+                                 '--single-transaction -d "$NEON_DATABASE_URL_UNPOOLED"'],
+                                stdin=dump, capture_output=True,
+                                encoding='utf-8', errors='replace')
+    print(result.stdout + result.stderr)
+    result.check_returncode()
+
+
 # Flow
 @flow(name='contrans-pipeline', log_prints=True)
 def contrans_pipeline():
@@ -56,13 +79,23 @@ def contrans_pipeline():
     processed_expenditures = make_expenditures.submit(wait_for=[schedule_e])
     processed_others = make_others.submit(wait_for=[committees, committee_membership,vote_similarity])
 
+    #processed_members = make_members.submit()
+    #processed_crosswalk = make_crosswalk.submit()
+    #processed_terms = make_terms.submit()
+    #processed_bills = make_bills.submit()
+    #processed_expenditures = make_expenditures.submit()
+    #processed_others = make_others.submit()
+
     docker = docker_launch.submit()
 
     to_postgres = data_to_postgres.submit(
         wait_for=[processed_members, processed_crosswalk, processed_terms, 
                   processed_bills, processed_expenditures, processed_others, docker]
         )
-    to_postgres.result()
+
+    neon_dump = deploy_neon_dump.submit(wait_for=[to_postgres])
+    neon_restore = deploy_neon_restore.submit(wait_for=[neon_dump])
+    neon_restore.result()
 
 if __name__ == '__main__':
     contrans_pipeline()
