@@ -434,6 +434,22 @@ class contrans:
         return "varchar"
 
 # Upload to Docker DB
+    
+    #Create new contrans DB
+    def create_new_db(self):
+        dbserver = psycopg.connect(
+            user = 'postgres',
+            password = POSTGRES_PASSWORD,
+            host = 'localhost',
+            port = '5432')
+        dbserver.autocommit = True
+        cursor = dbserver.cursor()
+        try:
+            cursor.execute('CREATE DATABASE contrans')
+        except:
+            cursor.execute('DROP DATABASE contrans')
+            cursor.execute('CREATE DATABASE contrans')
+
 
     #docker compose up
     def data_to_postgres(self):
