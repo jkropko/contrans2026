@@ -33,9 +33,9 @@ def docker_launch():
     result.check_returncode()
 
 ## Create new Postgres DB if contrans DB does not exist (GitHub actions always starts from scratch)
+create_new_db = task(ct.create_new_db, name='create_new_db')
 
 ## Upload processed data to postgres
-create_new_db = task(ct.create_new_db, name='create_new_db')
 data_to_postgres = task(ct.data_to_postgres, name='data_to_postgres')
 
 ## Deploy to Neon
@@ -81,13 +81,6 @@ def contrans_pipeline():
     processed_bills = make_bills.submit(wait_for=[bill_summaries, sponsored_legislation])
     processed_expenditures = make_expenditures.submit(wait_for=[schedule_e])
     processed_others = make_others.submit(wait_for=[committees, committee_membership,vote_similarity])
-
-    #processed_members = make_members.submit()
-    #processed_crosswalk = make_crosswalk.submit()
-    #processed_terms = make_terms.submit()
-    #processed_bills = make_bills.submit()
-    #processed_expenditures = make_expenditures.submit()
-    #processed_others = make_others.submit()
 
     docker = docker_launch.submit()
     new_db = create_new_db.submit(

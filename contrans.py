@@ -7,6 +7,7 @@ import dotenv
 import os
 import time
 import yaml
+import psycopg
 from sqlalchemy import create_engine
 
 class contrans:
@@ -439,7 +440,7 @@ class contrans:
     def create_new_db(self):
         dbserver = psycopg.connect(
             user = 'postgres',
-            password = POSTGRES_PASSWORD,
+            password = self.POSTGRES_PASSWORD,
             host = 'localhost',
             port = '5432')
         dbserver.autocommit = True
