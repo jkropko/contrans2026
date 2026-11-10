@@ -434,7 +434,7 @@ class contrans:
         return "varchar"
 
 # Upload to Docker DB
-    
+
     #docker compose up
     def data_to_postgres(self):
         engine = create_engine(self.engine)
