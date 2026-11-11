@@ -174,22 +174,47 @@ class contrans:
         spons['bioguide_id'] = bioguide_id
         return spons
 
-    def get_sponsored_legislation(self):
-        sl_list = []
-        failed = []
+    def get_sponsored_legislation(self, save_every=10):
+        outfile = 'data/raw/sponsored_legislation.parquet'
+        partial = 'data/raw/sponsored_legislation_partial.parquet'
+        done_file = 'data/raw/sponsored_legislation_done.json'
+
         ideology = pd.read_parquet('data/raw/ideology.parquet')
         bioguide_ids = ideology['bioguide_id'].dropna().unique()
-        for i, bioguide_id in enumerate(bioguide_ids):
+
+        # pick up where a failed attempt left off
+        try:
+            sl_list = [pd.read_parquet(partial)]
+            with open(done_file) as f:
+                done = set(json.load(f))
+            print(f'Resuming: {len(done)} of {len(bioguide_ids)} members already downloaded')
+        except FileNotFoundError:
+            sl_list, done = [], set()
+
+        def checkpoint():
+            pd.concat(sl_list, ignore_index=True).to_parquet(partial, index=False)
+            with open(done_file, 'w') as f:
+                json.dump(sorted(done), f)
+
+        failed = []
+        todo = [b for b in bioguide_ids if b not in done]
+        for i, bioguide_id in enumerate(todo):
             if i % 10 == 0:
-                print(f'Now uploading legislator {i} ({bioguide_id}) of {len(bioguide_ids)}')
+                print(f'Now downloading legislator {len(done) + 1} ({bioguide_id}) of {len(bioguide_ids)}')
             try:
-                spons = self.get_sponsored_legislation_member(bioguide_id)
-                sl_list.append(spons)
+                sl_list.append(self.get_sponsored_legislation_member(bioguide_id))
+                done.add(bioguide_id)
             except requests.HTTPError as e:
                 print(f'Skipping {bioguide_id}: {e}')
                 failed.append(bioguide_id)
-        spons = pd.concat(sl_list)
-        spons.to_parquet('data/raw/sponsored_legislation.parquet', index=False)
+            if (i + 1) % save_every == 0:
+                checkpoint()
+
+        # finished: write the real file, then remove the checkpoint so next run starts fresh
+        pd.concat(sl_list, ignore_index=True).to_parquet(outfile, index=False)
+        for f in (partial, done_file):
+            if os.path.exists(f):
+                os.remove(f)
         if failed:
             print(f'{len(failed)} members failed: {failed}')
 
