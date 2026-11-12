@@ -33,9 +33,9 @@ def docker_launch():
     result.check_returncode()
 
 ## Create new Postgres DB if contrans DB does not exist (GitHub actions always starts from scratch)
+create_new_db = task(ct.create_new_db, name='create_new_db')
 
 ## Upload processed data to postgres
-create_new_db = task(ct.create_new_db, name='create_new_db')
 data_to_postgres = task(ct.data_to_postgres, name='data_to_postgres')
 
 ## Deploy to Neon

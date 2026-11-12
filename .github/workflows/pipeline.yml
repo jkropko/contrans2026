@@ -1,6 +1,3 @@
-# Save as .github/workflows/pipeline.yml
-# Runs flow.py on a GitHub-hosted computer every Monday, reporting to Prefect Cloud.
-
 name: contrans-pipeline
 
 on:
