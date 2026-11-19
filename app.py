@@ -57,7 +57,9 @@ app.layout = html.Div(
                 dcc.Tab(label = 'Contact and Bio Info', children = [
                     html.Img(id = 'bioimage')
                     ]),
-                dcc.Tab(label = 'How They Vote', children = []),
+                dcc.Tab(label = 'How They Vote', children = [
+                    dcc.Graph(id = 'vote_scatter')
+                    ]),
                 dcc.Tab(label = 'Who Spends Money On Them?', children = []),
                 dcc.Tab(label = 'What Bills Do They Sponsor?', children = [])
                 ]
@@ -79,6 +81,31 @@ def get_image(b):
     image_url = pd.read_sql_query(myquery, con=engine)['image'][0]
     return [image_url]
 
+@app.callback([Output(component_id = 'vote_scatter', component_property = 'figure')], 
+              [Input(component_id = 'dropdown', component_property = 'value')])
+
+def make_scatterplot(b):
+    myquery = f'''
+        SELECT c.bioguide_id, vc.agree, m.left_right_ideology, m.party, m.state, m.district, m.full_name
+        FROM vote_compare vc
+        INNER JOIN crosswalk c 
+            ON vc.icpsr_comparison_member = c.icpsr
+        INNER JOIN members m
+            ON c.bioguide_id = m.bioguide_id
+        WHERE vc.icpsr_member = (SELECT icpsr
+                              FROM crosswalk
+                              WHERE bioguide_id='{b}'
+                              LIMIT 1)        
+    '''
+    scatter_data = pd.read_sql_query(myquery, con=engine)
+    fig = px.scatter(scatter_data,
+                     x = 'left_right_ideology',
+                     y = 'agree',
+                     hover_name = 'full_name',
+                     hover_data = ['state', 'district', 'party'],
+                     color = 'party',
+                     color_discrete_map = {'Democratic': 'blue', 'Republican':'Red'})
+    return [fig]
 
 # Run the dashboard
 if __name__=='__main__':

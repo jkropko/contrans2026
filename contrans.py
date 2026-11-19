@@ -126,19 +126,8 @@ class contrans:
         vote_compare = vote_compare.query("icpsr_x != icpsr_y")
         vote_compare['agree'] = vote_compare['cast_code_x'] == vote_compare['cast_code_y']
         vote_compare = vote_compare.groupby(['icpsr_x', 'icpsr_y']).agg({'agree': 'mean'}).reset_index()
-        crosswalk = pd.read_parquet('data/raw/ideology.parquet')
-        vote_compare =pd.merge(vote_compare, crosswalk,
-                left_on='icpsr_x',
-                right_on='icpsr',
-                how='inner')
-        vote_compare = vote_compare[['bioname', 'icpsr_y', 'agree']]
-        vote_compare =pd.merge(vote_compare, crosswalk,
-                left_on='icpsr_y',
-                right_on='icpsr',
-                how='inner')
-        vote_compare = vote_compare[['bioname_x', 'bioname_y', 'agree']]
-        vote_compare = vote_compare.rename({'bioname_x': 'bioname',
-                                        'bioname_y': 'comparison_member'}, axis=1)
+        vote_compare = vote_compare.rename({'icpsr_x': 'icpsr_member',
+                                            'icpsr_y': 'icpsr_comparison_member'}, axis=1)
         vote_compare.to_parquet('data/raw/vote_compare.parquet', index=False)
 
 ## Sponsored legislation
